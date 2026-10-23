@@ -1,0 +1,85 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360 # الحد الأقصى المسموح به من جيت هاب (6 ساعات)
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          # كلمة مرور قوية وثابتة التنسيق لمنع أخطاء التشفير
+          $Password = "P@ssw0rdSecure" + (Get-Random -Minimum 1000 -Maximum 9999) + "!"
+          $SecPassword = ConvertTo-SecureString $Password -AsPlainText -Force
+          
+          New-LocalUser -Name "RDPUser" -Password $SecPassword -FullName "RDP Admin" -Description "RDP Access User" -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          
+          echo "RDP_USER=RDPUser" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$Password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          # التثبيت عبر winget لضمان أحدث نسخة مستقرة ومسار سليم
+          winget install --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
+          $env:Path += ";C:\Program Files\Tailscale"
+
+      - name: Connect to Tailscale
+        shell: powershell
+        run: |
+          $tailscalePath = "C:\Program Files\Tailscale\tailscale.exe"
+          
+          # الاتصال مع تفعيل خيارات الاستقرار
+          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes
+          
+          # الانتظار حتى استلام عنوان IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & $tailscalePath ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Show Access Details and Keep Alive
+        shell: powershell
+        run: |
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "        RDP CONNECTION DETAILS           " -ForegroundColor Cyan
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "IP Address : $env:TAILSCALE_IP" -ForegroundColor Yellow
+          Write-Host "Username   : $env:RDP_USER" -ForegroundColor Yellow
+          Write-Host "Password   : $env:RDP_PASS" -ForegroundColor Yellow
+          Write-Host "Port       : 3389" -ForegroundColor Yellow
+          Write-Host "==========================================" -ForegroundColor Green
+          
+          # إبقاء السيرفر نشطاً طوال مدة الجلسة المتاحة
+          while ($true) {
+              Write-Host "[$(Get-Date)] Runner is alive and connected."
+              Start-Sleep -Seconds 60
+          }
